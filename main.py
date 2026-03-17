@@ -25,6 +25,8 @@ from torch.utils.data import Subset
 import webdataset as wds
 import wandb
 
+torch.set_float32_matmul_precision('high')
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -91,8 +93,6 @@ best_acc1 = 0
 def main():
     args = parser.parse_args()
 
-    run = wandb.init(project="imagenet", config=args)
-
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -135,15 +135,15 @@ def main():
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, run, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, run, args)
+        main_worker(args.gpu, ngpus_per_node, args)
 
 def label_to_index(label):
     return int(label) 
 
-def main_worker(gpu, ngpus_per_node, run, args):
+def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
 
@@ -165,6 +165,13 @@ def main_worker(gpu, ngpus_per_node, run, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+
+        is_main_process = not args.distributed or (args.distributed and args.rank == 0)
+    
+        if is_main_process:
+            run = wandb.init(project="imagenet", config=args)
+        else:
+            run = None
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -172,6 +179,8 @@ def main_worker(gpu, ngpus_per_node, run, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+    
+    model = model.to(memory_format=torch.channels_last)
     
     if args.compile:
         print("compiling the model with torch.compile...")
@@ -254,7 +263,8 @@ def main_worker(gpu, ngpus_per_node, run, args):
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-        train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar").shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
+        train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar", shardshuffle=1024).\
+            shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
              transforms.Compose([
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
@@ -275,7 +285,8 @@ def main_worker(gpu, ngpus_per_node, run, args):
         #         transforms.ToTensor(),
         #         normalize,
         #     ]))
-        val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar").decode("pil").to_tuple("jpg", "cls").map_tuple(
+        val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar", shardshuffle=False).\
+            decode("pil").to_tuple("jpg", "cls").map_tuple(
                 transforms.Compose([
                     transforms.Resize(256),
                     transforms.CenterCrop(224),
@@ -321,11 +332,11 @@ def main_worker(gpu, ngpus_per_node, run, args):
 
         # train for one epoch
         loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, device, args)
-        
-        run.log({"train/loss": loss, "train/acc1": train_acc1, "train/acc5": train_acc5}, step=epoch)
         # evaluate on validation set
         acc1, acc5 = validate(val_loader, model, criterion, args)
-        run.log({"val/acc1": acc1, "val/acc5": acc5}, step=epoch)
+        if run is not None:
+            run.log({"train/loss": loss, "train/acc1": train_acc1, "train/acc5": train_acc5}, step=epoch)
+            run.log({"val/acc1": acc1, "val/acc5": acc5}, step=epoch)
 
         scheduler.step()
         
@@ -469,7 +480,7 @@ def validate(val_loader, model, criterion, args):
     #         num_workers=args.workers, pin_memory=True)
     #     run_validate(aux_val_loader, len(val_loader))
 
-    # progress.display_summary()
+    progress.display_summary()
 
     return top1.avg, top5.avg
 
