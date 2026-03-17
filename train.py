@@ -1,25 +1,13 @@
 import torch
 import time
 import argparse
+import wandb 
 
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
 
 from moco import MoCo
-from utils import AverageMeter, ProgressMeter, accuracy
-
-
-class TwoCropsTransform:
-    """
-    Take two random crops of one image as the query and key.
-    """
-    def __init__(self, base_transform):
-        self.base_transform = base_transform
-
-    def __call__(self, x):
-        q = self.base_transform(x)
-        k = self.base_transform(x)
-        return [q, k]
+from utils import TwoCropsTransform, AverageMeter, ProgressMeter, accuracy
 
 def train(train_loader, model, criterion, optimizer, epoch, args) -> None:
     batch_time = AverageMeter("Time", ":6.3f")
@@ -68,6 +56,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args) -> None:
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return losses.avg, top1.avg, top5.avg
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch MoCo Training on a single gpu")
@@ -80,11 +69,14 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="./data", type=str, help="dataset root")
     parser.add_argument("--batch-size", default=256, type=int, help="batch size")
     parser.add_argument("--workers", default=4, type=int, help="data loader workers")
-    parser.add_argument("--epochs", default=1, type=int, help="number of epochs")
+    parser.add_argument("--epochs", default=10, type=int, help="number of epochs")
     parser.add_argument("--use_gpu", action="store_true", help="use gpu or not")
     parser.add_argument("--aug-plus", action="store_true", help="use MoCo v2's augmentation")
+
     args = parser.parse_args()
 
+    run = wandb.init(project="MoCo", name="MoCo-v2" if args.aug_plus else "MoCo-v1", config=vars(args))
+    
     normalize = transforms.Normalize(
         mean=(0.5071, 0.4867, 0.4408),
         std=(0.2675, 0.2565, 0.2761),
@@ -139,4 +131,6 @@ if __name__ == "__main__":
     optimizer = torch.optim.SGD(model.parameters(), lr=0.03, momentum=0.9, weight_decay=1e-4)
 
     for epoch in range(args.epochs):
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train_loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, args)
+        run.log({"epoch": epoch})
+        run.log({"train_loss": train_loss, "train_acc1": train_acc1, "train_acc5": train_acc5})
