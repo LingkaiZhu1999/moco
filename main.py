@@ -263,7 +263,15 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-        train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar", shardshuffle=1024).\
+        world_size = args.world_size if args.distributed else 1
+        num_workers = max(1, args.workers) 
+        train_samples_per_worker = 1281167 // (world_size * num_workers)
+        val_samples_per_worker = 50000 // (world_size * num_workers)
+
+        train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar",
+                                       nodesplitter=wds.split_by_node,
+                                       workersplitter=wds.split_by_worker,
+                                       shardshuffle=1024).\
             shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
              transforms.Compose([
                 transforms.RandomResizedCrop(224),
@@ -271,12 +279,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 transforms.ToTensor(),
                 normalize,
             ]), label_to_index
-        ).with_epoch(1281167 // args.world_size) # full pass 
+        ).with_epoch(train_samples_per_worker) 
 
-        train_dataset = train_dataset.compose(
-            wds.split_by_node, 
-            wds.split_by_worker
-        )
         # train_dataset = datasets.ImageFolder(
         #     traindir,
         #     transforms.Compose([
@@ -285,7 +289,10 @@ def main_worker(gpu, ngpus_per_node, args):
         #         transforms.ToTensor(),
         #         normalize,
         #     ]))
-        val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar", shardshuffle=False).\
+        val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar",
+                                    nodesplitter=wds.split_by_node,
+                                    workersplitter=wds.split_by_worker,
+                                    shardshuffle=False).\
             decode("pil").to_tuple("jpg", "cls").map_tuple(
                 transforms.Compose([
                     transforms.Resize(256),
@@ -293,7 +300,7 @@ def main_worker(gpu, ngpus_per_node, args):
                     transforms.ToTensor(),
                     normalize,
                 ]), label_to_index
-            )
+            ).with_epoch(val_samples_per_worker) 
         val_dataset = val_dataset.compose(
             wds.split_by_node,
             wds.split_by_worker
@@ -335,8 +342,14 @@ def main_worker(gpu, ngpus_per_node, args):
         # evaluate on validation set
         acc1, acc5 = validate(val_loader, model, criterion, args)
         if run is not None:
-            run.log({"train/loss": loss, "train/acc1": train_acc1, "train/acc5": train_acc5}, step=epoch)
-            run.log({"val/acc1": acc1, "val/acc5": acc5}, step=epoch)
+            run.log({
+                "train/loss": float(loss), 
+                "train/acc1": float(train_acc1), 
+                "train/acc5": float(train_acc5),
+                "val/acc1": float(acc1), 
+                "val/acc5": float(acc5),
+                "epoch": epoch
+            })
 
         scheduler.step()
         
