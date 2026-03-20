@@ -73,6 +73,7 @@ class MoCo(nn.Module):
             param_k.data = param_k.data * self.m + param_q.data * (1.0 - self.m)
 
     @torch.no_grad()
+    @torch.compiler.disable
     def _dequeue_and_enqueue(self, keys) -> None:
         # gather keys before updating queue
         keys = concat_all_gather(keys)
@@ -89,7 +90,6 @@ class MoCo(nn.Module):
         self.queue_ptr[0] = ptr
 
     @torch.no_grad()
-    @torch.compiler.disable
     def _batch_shuffle_ddp(self, x):
         """
         Batch shuffle, for making use of BatchNorm.
