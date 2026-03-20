@@ -1,5 +1,7 @@
 import torch
 from einops import rearrange, einsum, reduce
+import math
+import shutil
 
 class TwoCropsTransform:
     """
@@ -12,7 +14,13 @@ class TwoCropsTransform:
         q = self.base_transform(x)
         k = self.base_transform(x)
         return [q, k]
-    
+
+def save_checkpoint(state, is_best, filename: str = "checkpoint.pth.tar") -> None:
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, "model_best.pth.tar")
+
+
 class AverageMeter:
     """Computes and stores the average and current value"""
 
@@ -36,7 +44,8 @@ class AverageMeter:
     def __str__(self) -> str:
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
-    
+
+
 class ProgressMeter:
     def __init__(self, num_batches, meters, prefix: str = "") -> None:
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -52,7 +61,19 @@ class ProgressMeter:
         num_digits = len(str(num_batches // 1))
         fmt = "{:" + str(num_digits) + "d}"
         return "[" + fmt + "/" + fmt.format(num_batches) + "]"
-    
+
+
+def adjust_learning_rate(optimizer, epoch, args) -> None:
+    """Decay the learning rate based on schedule"""
+    lr = args.lr
+    if args.cos:  # cosine lr schedule
+        lr *= 0.5 * (1.0 + math.cos(math.pi * epoch / args.epochs))
+    else:  # stepwise lr schedule
+        for milestone in args.schedule:
+            lr *= 0.1 if epoch >= milestone else 1.0
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -66,6 +87,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = reduce(correct[:k], "k b -> 1", "sum").float()
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+    
