@@ -191,6 +191,8 @@ parser.add_argument("--cos", action="store_true", help="use cosine lr schedule")
 def main() -> None:
     args = parser.parse_args()
 
+    os.makedirs(f"./saved_model/{args.arch}/mocov1", exist_ok=True)
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -259,10 +261,10 @@ def main_worker(gpu, ngpus_per_node, args):
 
         is_main_process = not args.distributed or (args.distributed and args.rank == 0)
     
-        if is_main_process:
-            run = wandb.init(project="imagenet", config=args)
-        else:
-            run = None
+    if is_main_process:
+        run = wandb.init(project="Moco", config=args)
+    else:
+        run = None
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = MoCo(
@@ -276,7 +278,10 @@ def main_worker(gpu, ngpus_per_node, args):
     model = model.to(memory_format=torch.channels_last)
     if args.compile:
         print("compiling the model with torch.compile...")
-        model = torch.compile(model)
+        # model = torch.compile(model)
+        # only compile the encoders, since the rest part (e.g., queue) has some inplace update which is not supported by torch.compile
+        model.encoder_q = torch.compile(model.encoder_q)
+        model.encoder_k = torch.compile(model.encoder_k)
 
     # print(model)
 
@@ -416,21 +421,28 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
-
+        train_loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, args)
+        if run is not None:
+            run.log({
+                "train/loss": float(train_loss), 
+                "train/acc1": float(train_acc1), 
+                "train/acc5": float(train_acc5),
+                "epoch": epoch
+            })
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "arch": args.arch,
-                    "state_dict": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                },
-                is_best=False,
-                filename="checkpoint_{:04d}.pth.tar".format(epoch),
-            )
+            if epoch % 10 == 0:
+                save_checkpoint(
+                    {
+                        "epoch": epoch + 1,
+                        "arch": args.arch,
+                        "state_dict": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                    },
+                    is_best=False,
+                    filename=os.path.join(f"./saved_model/{args.arch}/mocov1", "checkpoint_{:04d}.pth.tar".format(epoch)),
+                )
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args) -> None:
@@ -481,6 +493,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args) -> None:
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return losses.avg, top1.avg, top5.avg
 
 
 def save_checkpoint(state, is_best, filename: str = "checkpoint.pth.tar") -> None:
