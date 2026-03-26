@@ -119,15 +119,20 @@ def load_moco_pretrained(model, checkpoint_path):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"=> no MoCo checkpoint found at '{checkpoint_path}'")
 
+    load_target = getattr(model, "_orig_mod", model)
+
     print(f"=> loading MoCo checkpoint '{checkpoint_path}'")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get('state_dict', checkpoint)
 
     filtered_state_dict = {}
     for key, value in state_dict.items():
-        if key.startswith('module.encoder_q.') and not key.startswith('module.encoder_q.fc'):
-            filtered_state_dict[key[len('module.encoder_q.'):]] = value
-        elif key.startswith('encoder_q.') and not key.startswith('encoder_q.fc'):
+        if key.startswith('module.'):
+            key = key[len('module.'):]
+        if key.startswith('_orig_mod.'):
+            key = key[len('_orig_mod.'):]
+
+        if key.startswith('encoder_q.') and not key.startswith('encoder_q.fc'):
             filtered_state_dict[key[len('encoder_q.'):]] = value
 
     if not filtered_state_dict:
@@ -135,7 +140,7 @@ def load_moco_pretrained(model, checkpoint_path):
             "=> MoCo checkpoint does not contain encoder_q weights in a supported format"
         )
 
-    msg = model.load_state_dict(filtered_state_dict, strict=False)
+    msg = load_target.load_state_dict(filtered_state_dict, strict=False)
     if msg.missing_keys != ['fc.weight', 'fc.bias'] or msg.unexpected_keys:
         raise ValueError(
             f"=> unexpected MoCo checkpoint mapping result: missing={msg.missing_keys}, "
@@ -149,8 +154,9 @@ def configure_linear_probe(model):
     for name, param in model.named_parameters():
         param.requires_grad = name in {'fc.weight', 'fc.bias'}
 
-    model.fc.weight.data.normal_(mean=0.0, std=0.01)
-    model.fc.bias.data.zero_()
+    with torch.no_grad():
+        model.fc.weight.normal_(mean=0.0, std=0.01)
+        model.fc.bias.zero_()
 
 
 def main():
