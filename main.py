@@ -16,7 +16,7 @@ import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.datasets as datasets
+import torchvision.datasets as tv_datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
@@ -34,6 +34,10 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
+parser.add_argument('--dataset-backend', default='webdataset', choices=['webdataset', 'huggingface'],
+                    help='dataset source to use (default: webdataset)')
+parser.add_argument('--hf-dataset', default='ILSVRC/imagenet-1k',
+                    help='Hugging Face dataset id to use when --dataset-backend=huggingface')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
@@ -61,10 +65,14 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--pretrained-moco', default='', type=str, metavar='PATH',
+                    help='path to a pretrained MoCo checkpoint for linear probing')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
+parser.add_argument('--linear-probe', action='store_true',
+                    help='freeze the backbone and train only the final fc layer')
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
@@ -88,6 +96,61 @@ parser.add_argument('--dummy', action='store_true', help="use fake data to bench
 parser.add_argument('--compile', action='store_true', help="use torch.compile to compile the model")
 
 best_acc1 = 0
+
+
+class HuggingFaceImageNet(torch.utils.data.Dataset):
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        image = sample['image']
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        target = int(sample['label'])
+        return self.transform(image), target
+
+
+def load_moco_pretrained(model, checkpoint_path):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"=> no MoCo checkpoint found at '{checkpoint_path}'")
+
+    print(f"=> loading MoCo checkpoint '{checkpoint_path}'")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get('state_dict', checkpoint)
+
+    filtered_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('module.encoder_q.') and not key.startswith('module.encoder_q.fc'):
+            filtered_state_dict[key[len('module.encoder_q.'):]] = value
+        elif key.startswith('encoder_q.') and not key.startswith('encoder_q.fc'):
+            filtered_state_dict[key[len('encoder_q.'):]] = value
+
+    if not filtered_state_dict:
+        raise ValueError(
+            "=> MoCo checkpoint does not contain encoder_q weights in a supported format"
+        )
+
+    msg = model.load_state_dict(filtered_state_dict, strict=False)
+    if msg.missing_keys != ['fc.weight', 'fc.bias'] or msg.unexpected_keys:
+        raise ValueError(
+            f"=> unexpected MoCo checkpoint mapping result: missing={msg.missing_keys}, "
+            f"unexpected={msg.unexpected_keys}"
+        )
+
+    print(f"=> loaded MoCo pretrained weights from '{checkpoint_path}'")
+
+
+def configure_linear_probe(model):
+    for name, param in model.named_parameters():
+        param.requires_grad = name in {'fc.weight', 'fc.bias'}
+
+    model.fc.weight.data.normal_(mean=0.0, std=0.01)
+    model.fc.bias.data.zero_()
 
 
 def main():
@@ -146,6 +209,7 @@ def label_to_index(label):
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
+    run = None
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -179,6 +243,11 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+
+    if args.pretrained_moco:
+        load_moco_pretrained(model, args.pretrained_moco)
+    if args.linear_probe:
+        configure_linear_probe(model)
     
     model = model.to(memory_format=torch.channels_last)
     
@@ -221,7 +290,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    parameters = [param for param in model.parameters() if param.requires_grad]
+    optimizer = torch.optim.SGD(parameters, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     
@@ -255,75 +325,79 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     if args.dummy:
         print("=> Dummy data is used!")
-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
+        train_dataset = tv_datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+        val_dataset = tv_datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
     else:
         # traindir = os.path.join(args.data, 'train')
         # valdir = os.path.join(args.data, 'val')
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-        world_size = args.world_size if args.distributed else 1
-        num_workers = max(1, args.workers) 
-        train_samples_per_worker = 1281167 // (world_size * num_workers)
-        val_samples_per_worker = 50000 // (world_size * num_workers)
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        val_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ])
 
-        train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar",
-                                       nodesplitter=wds.split_by_node,
-                                       workersplitter=wds.split_by_worker,
-                                       shardshuffle=1024).\
-            shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
-             transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), label_to_index
-        ).with_epoch(train_samples_per_worker) 
+        if args.dataset_backend == 'huggingface':
+            from datasets import load_dataset
 
-        # train_dataset = datasets.ImageFolder(
-        #     traindir,
-        #     transforms.Compose([
-        #         transforms.RandomResizedCrop(224),
-        #         transforms.RandomHorizontalFlip(),
-        #         transforms.ToTensor(),
-        #         normalize,
-        #     ]))
-        val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar",
-                                    nodesplitter=wds.split_by_node,
-                                    workersplitter=wds.split_by_worker,
-                                    shardshuffle=False).\
-            decode("pil").to_tuple("jpg", "cls").map_tuple(
-                transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    normalize,
-                ]), label_to_index
-            ).with_epoch(val_samples_per_worker) 
-        val_dataset = val_dataset.compose(
-            wds.split_by_node,
-            wds.split_by_worker
-        )
-        # val_dataset = datasets.ImageFolder(
-        #     valdir,
-        #     transforms.Compose([
-        #         transforms.Resize(256),
-        #         transforms.CenterCrop(224),
-        #         transforms.ToTensor(),
-        #         normalize,
-        #     ]))
+            train_dataset = HuggingFaceImageNet(
+                load_dataset(args.hf_dataset, split='train'),
+                train_transform,
+            )
+            val_dataset = HuggingFaceImageNet(
+                load_dataset(args.hf_dataset, split='validation'),
+                val_transform,
+            )
+        else:
+            world_size = args.world_size if args.distributed else 1
+            num_workers = max(1, args.workers)
+            train_samples_per_worker = 1281167 // (world_size * num_workers)
+            val_samples_per_worker = 50000 // (world_size * num_workers)
+
+            train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar",
+                                           nodesplitter=wds.split_by_node,
+                                           workersplitter=wds.split_by_worker,
+                                           shardshuffle=1024).\
+                shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
+                 train_transform, label_to_index
+            ).with_epoch(train_samples_per_worker)
+
+            val_dataset = wds.WebDataset(args.data + "imagenet1k-validation-{00..63}.tar",
+                                        nodesplitter=wds.split_by_node,
+                                        workersplitter=wds.split_by_worker,
+                                        shardshuffle=False).\
+                decode("pil").to_tuple("jpg", "cls").map_tuple(
+                    val_transform, label_to_index
+                ).with_epoch(val_samples_per_worker)
+            val_dataset = val_dataset.compose(
+                wds.split_by_node,
+                wds.split_by_worker
+            )
 
     # if args.distributed:
     #     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     #     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
     # else:
-    train_sampler = None
-    val_sampler = None
+    if args.distributed and args.dataset_backend == 'huggingface' and not args.dummy:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+    else:
+        train_sampler = None
+        val_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, 
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler,
+        shuffle=train_sampler is None and args.dataset_backend == 'huggingface')
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, 
@@ -334,8 +408,8 @@ def main_worker(gpu, ngpus_per_node, args):
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-        # if args.distributed:
-        #     train_sampler.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         # train for one epoch
         loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, device, args)
