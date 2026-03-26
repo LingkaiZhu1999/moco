@@ -156,6 +156,12 @@ def configure_linear_probe(model):
 def main():
     args = parser.parse_args()
 
+    if args.linear_probe:
+        os.makedirs(f"./saved_model/{args.arch}/linear_probe", exist_ok=True)
+    else:
+        os.makedirs(f"./saved_model/{args.arch}/supervised", exist_ok=True)
+
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -295,8 +301,9 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    if not args.linear_probe:
+        """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
     
     # optionally resume from a checkpoint
     if args.resume:
@@ -315,7 +322,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
+            if not args.linear_probe:
+                scheduler.load_state_dict(checkpoint['scheduler'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -425,7 +433,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 "epoch": epoch
             })
 
-        scheduler.step()
+        if not args.linear_probe:
+            scheduler.step() 
         
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -439,8 +448,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-                'scheduler' : scheduler.state_dict()
-            }, is_best)
+                'scheduler' : scheduler.state_dict() if not args.linear_probe else None,
+            }, is_best, 
+            filename=f"./saved_model/{args.arch}/{'linear_probe' if args.linear_probe else 'supervised'}/checkpoint_{epoch:04d}.pth.tar")
 
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
